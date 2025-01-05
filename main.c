@@ -1,52 +1,55 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>  // For abs()
 #include "xc.h"
+
+#ifndef FCY
 #define FCY 4000000UL
+#endif
 #include <libpic30.h>
 
 // Global variables
-uint8_t mode = 0;          // 0 = composite, 1 = individual color mode
-uint8_t currentColor = 0;  // 0 = RED, 1 = GREEN, 2 = BLUE
-uint16_t storedRed = 0, storedGreen = 0, storedBlue = 0;
-uint8_t potSynced = 1;     // Potentiometer synchronization flag
+uint8_t displayMode = 0;      // 0 = blended display, 1 = single-color display
+uint8_t activeColor = 0;      // 0 = RED, 1 = GREEN, 2 = BLUE
+uint16_t savedRed = 0, savedGreen = 0, savedBlue = 0;  // Brightness values for each color
+uint8_t potentiometerSynced = 0;  // Flag to track if potentiometer matches saved value
 
 // Function Prototypes
-void SYSTEM_Initialize(void);
-void User_Initialize(void);
-void PWM_Initialize(void);
-uint16_t Read_Potentiometer(void);
-void Handle_Switches(void);
-void Toggle_Mode(void);
-void Cycle_Color(void);
-void Update_Composite_Mode(uint16_t adcValue);
-void Update_Individual_Mode(uint16_t adcValue);
-void Set_LED(uint8_t led, uint8_t state);
+void GPIO_Init(void);
+void PWM_Init(void);
+uint16_t Read_PotValue(void);
+void Process_Buttons(void);
+void Switch_DisplayMode(void);
+void Switch_To_NextColor(void);
+void Adjust_Composite_Brightness(uint16_t potValue);
+void Adjust_Color_Brightness(uint16_t potValue);
+void Update_LED_Output(uint8_t led, uint8_t state);
+void Save_Current_Brightness(void);
 
 // Main Function
 int main(void) {
-    SYSTEM_Initialize();
-    User_Initialize();
-    PWM_Initialize();
+    GPIO_Init();
+    PWM_Init();
 
     while (1) {
-        uint16_t adcValue = Read_Potentiometer(); // Read potentiometer value
-        
-        if (mode == 0) { // Composite mode
-            Update_Composite_Mode(adcValue);
-        } else { // Individual color mode
-            Update_Individual_Mode(adcValue);
+        uint16_t potValue = Read_PotValue();  // Read potentiometer value
+
+        if (displayMode == 0) {  // Blended color display mode
+            Adjust_Composite_Brightness(potValue);
+        } else {  // Single-color display mode
+            Adjust_Color_Brightness(potValue);
         }
 
-        Handle_Switches(); // Handle S1 and S2 logic
+        Process_Buttons();  // Handle S1 and S2 button presses
     }
 
     return 0;
 }
 
-// Initialization Functions
-void User_Initialize(void) {
-    TRISA |= (1 << 11) | (1 << 12); // S1, S2 as input
-    TRISA &= ~((1 << 8) | (1 << 9)); // LED1, LED2 as output
+
+void GPIO_Init(void) {
+    TRISA |= (1 << 11) | (1 << 12);  // S1, S2 as input
+    TRISA &= ~((1 << 8) | (1 << 9));  // LED1, LED2 as output
     ANSB |= (1 << 12);  // Potentiometer (AN8) as analog input
 
     AD1CON1 = 0x00;
@@ -59,10 +62,10 @@ void User_Initialize(void) {
     AD1CON3 = 0x00;
     AD1CON3bits.ADCS = 0xFF;
     AD1CON3bits.SAMC = 0x10;
-    AD1CHS = 0x08; // AN8
+    AD1CHS = 0x08;  // AN8
 }
 
-void PWM_Initialize(void) {
+void PWM_Init(void) {
     RPOR13bits.RP26R = 13;
     RPOR13bits.RP27R = 14;
     RPOR11bits.RP23R = 15;
@@ -73,84 +76,93 @@ void PWM_Initialize(void) {
     OC1CON1bits.OCM = OC2CON1bits.OCM = OC3CON1bits.OCM = 0b110;
     OC1CON2bits.SYNCSEL = OC2CON2bits.SYNCSEL = OC3CON2bits.SYNCSEL = 0x1F;
     OC1RS = OC2RS = OC3RS = 1023;
-    OC1R = OC2R = OC3R = 0;
+    OC1R = OC2R = OC3R = 0;  // Start with 0 intensity
 }
 
-// Input Handling
-uint16_t Read_Potentiometer(void) {
-    AD1CON1bits.SAMP = 1;      // Start sampling
-    __delay_us(10);            // Allow sampling time
-    AD1CON1bits.SAMP = 0;      // End sampling, start conversion
-    while (!AD1CON1bits.DONE); // Wait for conversion
-    return ADC1BUF0;           // Return 10-bit result
+uint16_t Read_PotValue(void) {
+    AD1CON1bits.SAMP = 1;  // Start sampling
+    __delay_us(10);        // Allow sampling time
+    AD1CON1bits.SAMP = 0;  // End sampling, start conversion
+    while (!AD1CON1bits.DONE);  // Wait for conversion
+    return ADC1BUF0;  // Return 10-bit result
 }
 
-void Handle_Switches(void) {
-    if (!(PORTA & (1 << 11))) { // S1 is pressed
-        Set_LED(1, 1); // Turn on LED1
-        __delay_ms(20); // Debounce delay
-        while (!(PORTA & (1 << 11))); // Wait for release
-        Toggle_Mode();
-    } else {
-        Set_LED(1, 0); // Turn off LED1
+void Process_Buttons(void) {
+    if (!(PORTA & (1 << 11))) {  // S1 is pressed
+        __delay_ms(20);  // Debounce delay
+        Switch_DisplayMode();
+        while (!(PORTA & (1 << 11)));  // Wait for release
     }
 
-    if (!(PORTA & (1 << 12))) { // S2 is pressed
-        Set_LED(2, 1); // Turn on LED2
-        __delay_ms(20); // Debounce delay
-        while (!(PORTA & (1 << 12))); // Wait for release
-        Cycle_Color();
-    } else {
-        Set_LED(2, 0); // Turn off LED2
+    if (!(PORTA & (1 << 12))) {  // S2 is pressed
+        __delay_ms(20);  // Debounce delay
+        Switch_To_NextColor();
+        while (!(PORTA & (1 << 12)));  // Wait for release
     }
 }
 
-void Toggle_Mode(void) {
-    mode ^= 1; // Toggle mode
-    potSynced = 1; // Reset sync
+void Switch_DisplayMode(void) {
+    displayMode ^= 1;  // Toggle between blended and single-color modes
+    potentiometerSynced = 0;  // Reset potentiometer sync
 }
 
-void Cycle_Color(void) {
-    currentColor = (currentColor + 1) % 3; // Cycle colors
-    potSynced = 0; // Reset sync for new color
-}
+void Switch_To_NextColor(void) {
+    if (displayMode == 1) {  // Only switch colors in single-color mode
+        Save_Current_Brightness();
 
-void Update_Composite_Mode(uint16_t adcValue) {
-    float scale = adcValue / 1023.0;  // Scale factor as a percentage
+        // Cycle through the colors
+        activeColor = (activeColor + 1) % 3;
 
-    // Scale stored values by the potentiometer reading
-    OC1R = (uint16_t)(storedRed * scale);   // Red LED intensity
-    OC2R = (uint16_t)(storedGreen * scale); // Green LED intensity
-    OC3R = (uint16_t)(storedBlue * scale);  // Blue LED intensity
-}
-
-void Update_Individual_Mode(uint16_t adcValue) {
-    switch (currentColor) {
-        case 0: // RED
-            if (!potSynced && abs(adcValue - storedRed) < 5) potSynced = 1;
-            if (potSynced) storedRed = adcValue;
-            OC1R = potSynced ? storedRed : adcValue;
-            OC2R = 0; OC3R = 0;
-            break;
-
-        case 1: // GREEN
-            if (!potSynced && abs(adcValue - storedGreen) < 5) potSynced = 1;
-            if (potSynced) storedGreen = adcValue;
-            OC1R = 0; OC2R = potSynced ? storedGreen : adcValue; OC3R = 0;
-            break;
-
-        case 2: // BLUE
-            if (!potSynced && abs(adcValue - storedBlue) < 5) potSynced = 1;
-            if (potSynced) storedBlue = adcValue;
-            OC1R = 0; OC2R = 0; OC3R = potSynced ? storedBlue : adcValue;
-            break;
+        // Reset sync flag to require potentiometer match
+        potentiometerSynced = 0;
     }
 }
 
-void Set_LED(uint8_t led, uint8_t state) {
-    if (led == 1) {
-        LATAbits.LATA8 = state; // Control LED1
-    } else if (led == 2) {
-        LATAbits.LATA9 = state; // Control LED2
-    }
+void Save_Current_Brightness(void) {
+    switch (activeColor) {
+        case 0: savedRed = OC1R; break;
+        case 1: savedGreen = OC2R; break;
+        case 2: savedBlue = OC3R; break;
+    }
+}
+
+void Adjust_Composite_Brightness(uint16_t potValue) {
+    float scale = potValue / 1023.0;  // Scale factor as a percentage
+
+    // Apply the scale factor to the saved values
+    OC1R = (uint16_t)(savedRed * scale);   // Red LED intensity
+    OC2R = (uint16_t)(savedGreen * scale); // Green LED intensity
+    OC3R = (uint16_t)(savedBlue * scale);  // Blue LED intensity
+}
+
+void Adjust_Color_Brightness(uint16_t potValue) {
+    uint16_t *currentBrightness = NULL;
+
+    switch (activeColor) {
+        case 0:  // RED
+            currentBrightness = &savedRed;
+            OC1R = potentiometerSynced ? potValue : *currentBrightness;
+            OC2R = OC3R = 0;
+            break;
+        case 1:  // GREEN
+            currentBrightness = &savedGreen;
+            OC2R = potentiometerSynced ? potValue : *currentBrightness;
+            OC1R = OC3R = 0;
+            break;
+        case 2:  // BLUE
+            currentBrightness = &savedBlue;
+            OC3R = potentiometerSynced ? potValue : *currentBrightness;
+            OC1R = OC2R = 0;
+            break;
+    }
+
+    // Sync the potentiometer if it matches the saved value
+    if (!potentiometerSynced && abs(potValue - *currentBrightness) < 5) {
+        potentiometerSynced = 1;
+    }
+
+    // If it's the first time, set the saved value
+    if (*currentBrightness == 0) {
+        *currentBrightness = potValue;
+    }
 }
